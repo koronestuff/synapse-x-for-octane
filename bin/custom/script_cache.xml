@@ -1,0 +1,336 @@
+<?xml version="1.0" encoding="utf-8"?>
+<StoredScripts xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" DefaultIndex="3">
+  <ScriptCache>
+    <Script Filename="Script 1" Path="">
+      <Contents>local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService       = game:GetService("HttpService")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+if _G.__CRATE_STATE and _G.__CRATE_STATE.running then
+    _G.__CRATE_STATE.halt()
+    print("[ALT] halted — execute again to boot")
+    return
+end
+
+local CONFIG = {
+    webhook     = "https://discord.com/api/webhooks/1574182521871147028/MOGhJuGoyoEs5iUv0FQDszRubI0YGEcrzjt21-1bWzvCLmMejqUKVBN7CMX9Fy__eddN",
+    concurrency = 999,                                 -- total workers, not per-crate
+    minDelay    = 0.2,                                   -- seconds
+    maxDelay    = 0.2,                                -- seconds; randomized per fire
+    currencies  = { "Coins", "Gems" },
+    stopKey     = Enum.KeyCode.RightShift,
+    chatCommands = { ";stop", "/stop", ";halt", "/halt", ";off" },
+    statsEverySec = 10,
+    debugAttempts = 8,
+    watchdogPeriod = 3,
+    stallThreshold = 30,
+}
+
+local crateNames = {
+    "KnifeBox1", "KnifeBox2", "KnifeBox3", "KnifeBox4", "KnifeBox5",
+    "GunBox1", "GunBox2", "GunBox3",
+    "MysteryBox1", "MysteryBox2",
+    "MLG Box",
+    "ThanksGiving_Box",
+}
+
+local godlies = {
+    ["FireBat"]=true, ["FireDog"]=true, ["Deathshard"]=true,
+    ["Fang"]=true, ["Saw"]=true, ["Slasher"]=true, ["Tides"]=true,
+    ["Gemstone"]=true, ["Darkbringer"]=true, ["Lightbringer"]=true,
+    ["Heat"]=true, ["Luger"]=true, ["Shark"]=true, ["Laser"]=true,
+    ["Doombringer"]=true,
+}
+
+local chromas = {
+    ["Chroma Seer"]=true, ["Chroma Gingerblade"]=true, ["Chroma Slasher"]=true,
+    ["Chroma Fang"]=true, ["Chroma Deathshard"]=true, ["Chroma Tides"]=true,
+    ["Chroma Gemstone"]=true, ["Chroma Heat"]=true, ["Chroma Luger"]=true,
+    ["Chroma Shark"]=true, ["Chroma Laser"]=true, ["Chroma Lightbringer"]=true,
+    ["Chroma Darkbringer"]=true, ["Chroma Saw"]=true, ["Chroma Star"]=true,
+    ["Chroma Corrupt"]=true, ["Chroma Boneblade"]=true, ["Chroma Snowflake"]=true,
+    ["Chroma Elderwood Blade"]=true,
+}
+
+local spawnFn   = (task and task.spawn) or spawn
+local heartbeat = RunService.Heartbeat
+local hbWait    = heartbeat.Wait
+local pcall     = pcall
+local clock     = os.clock
+local random    = math.random
+
+math.randomseed(tick() * 1000 % 1000000)
+
+local requestFn, requestFnName
+do
+    local tbl = (typeof and typeof(syn) == "table" and syn) or {}
+    if type(tbl.request) == "function" then requestFn, requestFnName = tbl.request, "syn.request" end
+    if not requestFn and typeof and typeof(http) == "table" and type(http.request) == "function" then
+        requestFn, requestFnName = http.request, "http.request"
+    end
+    if not requestFn and type(http_request) == "function" then requestFn, requestFnName = http_request, "http_request" end
+    if not requestFn and type(request) == "function" then requestFn, requestFnName = request, "request" end
+end
+
+local remote
+do
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local shop    = remotes and remotes:FindFirstChild("Shop")
+    remote = shop and shop:FindFirstChild("OpenCrate")
+end
+if not remote then
+    warn("[ALT] remote not found")
+    return
+end
+
+pcall(function()
+    game:GetService("NetworkClient"):SetOutgoingKBPSLimit(math.huge)
+end)
+
+local state = {
+    running = true, stopped = false,
+    totalFires = 0, totalSuccess = 0,
+    godlyCount = 0, chromaCount = 0,
+    webhookSent = 0, webhookFail = 0,
+    lastFireAt = clock(),
+    restarts   = 0,
+    perCurrency = {},
+    perCrate    = {},
+}
+for _, c in ipairs(CONFIG.currencies) do state.perCurrency[c] = 0 end
+for _, c in ipairs(crateNames) do state.perCrate[c] = 0 end
+
+local generation = 0
+
+local function extractItemName(r)
+    if type(r) == "string" then return r end
+    if type(r) == "table" then
+        return r.Name or r.name or r.Item or r.item or r.Value or r.value or r[1]
+    end
+end
+
+local function postWebhook(text)
+    if not requestFn then return false end
+    local ok, err = pcall(function()
+        requestFn({
+            Url = CONFIG.webhook, Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ content = text }),
+        })
+    end)
+    if ok then state.webhookSent = state.webhookSent + 1
+    else state.webhookFail = state.webhookFail + 1; warn("[ALT] webhook: " .. tostring(err)) end
+    return ok
+end
+
+local function notifyGodly(item, crate, currency)
+    print(string.format("GODLY FOUND: %s [%s/%s]", item, crate, currency))
+    state.godlyCount = state.godlyCount + 1
+    postWebhook(string.format("HIT (%s): %s  [%s/%s]", LocalPlayer.Name, tostring(item), crate, currency))
+end
+
+local function notifyChroma(item, crate, currency)
+    print(string.format("CHROMA FOUND: %s [%s/%s]", item, crate, currency))
+    state.chromaCount = state.chromaCount + 1
+    postWebhook(string.format("CHROMA (%s): %s  [%s/%s]", LocalPlayer.Name, tostring(item), crate, currency))
+end
+
+local function classify(item)
+    if not item then return nil end
+    if chromas[item] then return "chroma" end
+    if godlies[item] then return "godly"  end
+end
+
+local lastStats = clock()
+local function tick()
+    local now = clock()
+    if (now - lastStats) &gt;= CONFIG.statsEverySec then
+        local cur = {}
+        for _, c in ipairs(CONFIG.currencies) do
+            cur[#cur+1] = c .. "=" .. tostring(state.perCurrency[c] or 0)
+        end
+        print(string.format("[ALT] %d req/s | godly %d | chroma %d | wh %d/%d | %s",
+            state.totalFires / (now - lastStats),
+            state.godlyCount, state.chromaCount,
+            state.webhookSent, state.webhookFail,
+            table.concat(cur, " ")))
+        state.totalFires = 0
+        for _, c in ipairs(CONFIG.currencies) do state.perCurrency[c] = 0 end
+        for _, c in ipairs(crateNames) do state.perCrate[c] = 0 end
+        lastStats = now
+    end
+end
+
+local halt
+halt = function(reason)
+    if state.stopped then return end
+    state.stopped = true; state.running = false
+    generation = generation + 1
+    _G.__CRATE_STATE = nil; _G.CRATE_STOP = nil
+    print("[ALT] halted — " .. tostring(reason or "manual"))
+end
+state.halt = halt
+
+-- ─── worker: random crate, random currency, random delay ──────────────
+local function worker(gen, workerId)
+    local call   = remote.InvokeServer
+    local names  = crateNames
+    local nNames = #names
+    local curs   = CONFIG.currencies
+    local nCurs  = #curs
+    local minD   = CONFIG.minDelay
+    local maxD   = CONFIG.maxDelay
+
+    while state.running and gen == generation do
+        local crate    = names[random(nNames)]
+        local currency = curs[random(nCurs)]
+
+        local ok, result = pcall(call, remote, crate, false, currency)
+        if gen ~= generation then return end
+
+        state.totalFires = state.totalFires + 1
+        state.lastFireAt = clock()
+        state.perCurrency[currency] = (state.perCurrency[currency] or 0) + 1
+        state.perCrate[crate]       = (state.perCrate[crate] or 0) + 1
+
+        if CONFIG.debugAttempts &gt; 0 and state.totalFires &lt;= CONFIG.debugAttempts then
+            print(string.format("[debug] w%d %s/%s ok=%s res=%s",
+                workerId, crate, currency, tostring(ok), tostring(result)))
+        end
+
+        if ok then
+            state.totalSuccess = state.totalSuccess + 1
+            local item = extractItemName(result)
+            local kind = classify(item)
+            if kind == "chroma" then notifyChroma(item, crate, currency)
+            elseif kind == "godly" then notifyGodly(item, crate, currency) end
+        end
+
+        local d = minD + random() * (maxD - minD)
+        if d &gt; 0 then task.wait(d) end
+    end
+end
+
+-- ─── event path: same randomness, batched per frame ───────────────────
+local function runEventPath(gen)
+    local fire   = remote.FireServer
+    local names  = crateNames
+    local nNames = #names
+    local curs   = CONFIG.currencies
+    local nCurs  = #curs
+    local burst  = CONFIG.concurrency
+    local conn
+    conn = heartbeat:Connect(function()
+        if not state.running or gen ~= generation then
+            conn:Disconnect(); return
+        end
+        for _ = 1, burst do
+            local crate    = names[random(nNames)]
+            local currency = curs[random(nCurs)]
+            pcall(fire, remote, crate, false, currency)
+            state.totalFires = state.totalFires + 1
+            state.perCurrency[currency] = (state.perCurrency[currency] or 0) + 1
+            state.perCrate[crate]       = (state.perCrate[crate] or 0) + 1
+        end
+        state.lastFireAt = clock()
+        state.totalSuccess = state.totalSuccess + burst
+        tick()
+    end)
+end
+
+local startAll
+startAll = function()
+    generation = generation + 1
+    local gen = generation
+    local ok, err = pcall(function()
+        if remote:IsA("RemoteEvent") then
+            runEventPath(gen)
+            print(string.format("[ALT] firing EVENT — %d fires/frame, random crate+currency", CONFIG.concurrency))
+        else
+            for i = 1, CONFIG.concurrency do
+                spawnFn(function() worker(gen, i) end)
+            end
+            spawnFn(function()
+                while state.running and gen == generation do
+                    hbWait(heartbeat); tick()
+                end
+            end)
+            print(string.format("[ALT] firing FUNCTION — %d workers, random crate+currency, delay %.0f-%.0fms",
+                CONFIG.concurrency, CONFIG.minDelay * 1000, CONFIG.maxDelay * 1000))
+        end
+    end)
+    if not ok then warn("[ALT] startAll error: " .. tostring(err)) end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    print("[ALT] CharacterAdded — restarting")
+    generation = generation + 1
+    hbWait(heartbeat); hbWait(heartbeat); hbWait(heartbeat)
+    if state.running and not state.stopped then startAll() end
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function()
+    print("[ALT] CharacterRemoving")
+end)
+
+LocalPlayer.AncestryChanged:Connect(function(_, parent)
+    if not parent then
+        print("[ALT] LocalPlayer removed from game")
+        state.running = false
+    end
+end)
+
+spawnFn(function()
+    local lastCheck = clock()
+    while state.running and not state.stopped do
+        hbWait(heartbeat)
+        local now = clock()
+        if (now - lastCheck) &gt;= CONFIG.watchdogPeriod then
+            local sinceFire = now - state.lastFireAt
+            if sinceFire &gt;= CONFIG.stallThreshold then
+                state.restarts = state.restarts + 1
+                print(string.format("[ALT] WATCHDOG: no fire in %.1fs — restarting (#%d)",
+                    sinceFire, state.restarts))
+                startAll()
+            end
+            lastCheck = now
+        end
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == CONFIG.stopKey then halt("hotkey") end
+end)
+
+LocalPlayer.Chatted:Connect(function(msg)
+    local low = msg:lower()
+    for _, c in ipairs(CONFIG.chatCommands) do
+        if low == c then halt("chat"); return end
+    end
+end)
+
+_G.CRATE_STOP = halt
+
+print("[ALT] requestFn = " .. tostring(requestFnName or "NONE"))
+print("[ALT] remote class = " .. remote.ClassName)
+print("[ALT] currencies = " .. table.concat(CONFIG.currencies, ", ") ..
+      " | concurrency = " .. CONFIG.concurrency)
+
+startAll()
+
+_G.__CRATE_STATE = state
+print("[ALT] stop: RightShift / chat ';stop' / _G.CRATE_STOP()")</Contents>
+    </Script>
+    <Script Filename="Script 2" Path="">
+      <Contents>print(game.Players.LocalPlayer.PlayerGui.MainGUI.Game.Shop.Title.Coins.Container.Amount.Text)</Contents>
+    </Script>
+    <Script Filename="Script 3" Path="">
+      <Contents />
+    </Script>
+  </ScriptCache>
+</StoredScripts>
